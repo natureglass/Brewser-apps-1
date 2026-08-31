@@ -1,31 +1,26 @@
 name: Build catalogue
 
-# Rebuilds catalogue.json (+ artifacts/) from the flat apps/<id>/ folders.
+# Extended storage repo (source "ext1", served at play1.brewser.io). Builds THIS
+# repo's index-fragment.json + artifacts/ from its flat apps/<id>/ folders. This
+# repo has NO catalogue.json of its own — the BASE repo (natureglass/Brewser-apps)
+# owns the merged catalogue.json the Switch runtime reads. See docs/catalogue-v2.md.
 #
-# Fires whenever apps change — in particular when the Brewser WordPress plugin's
-# Approve action promotes an approved app into apps/<package-id>/ (a commit made
-# with a PAT, so it triggers this workflow). Each run is a full rebuild from the
-# current tree, so it is idempotent and self-healing: a missed event is fixed by
-# the next run.
+# After the fragment is (re)built and committed, this repo's Pages deploy
+# (pages.yml) republishes play1.brewser.io AND pings the base repo to re-merge
+# the master catalogue — see the "Notify base repo" step in pages.yml. The base
+# repo's scheduled safety-net converges anyway if that ping is ever missed.
 #
-# Loop-safe: the bot commit below only touches catalogue.json and artifacts/ —
-# never apps/** — so it does not re-trigger this workflow (and a GITHUB_TOKEN
-# commit wouldn't trigger workflows anyway).
-
-# Trigger scope is deliberate (C4): apps/** and curation.json ONLY.
-# stats.json is committed DAILY by the WordPress stats publisher and must
-# never rebuild/republish the catalogue — operational counters are not
-# catalogue inputs. If a new catalogue input is ever added, extend `paths`
-# here in the same change that adds its producer.
+# Fires on push to apps/** (the plugin's promote / edit / delete) and manual
+# dispatch. The bot commit only touches index-fragment.json + artifacts/ (never
+# apps/**), so it can't re-trigger this workflow — and a GITHUB_TOKEN commit
+# wouldn't trigger workflows anyway.
 on:
   push:
     branches: [ main ]
     paths:
       - 'apps/**'
-      - 'curation.json'
   workflow_dispatch: {}
 
-# Serialize runs so two rebuilds can't race the same fast-forward push.
 concurrency:
   group: build-catalogue
   cancel-in-progress: false
@@ -45,26 +40,25 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Rebuild + commit catalogue (race-safe)
+      - name: Rebuild + commit fragment (race-safe)
         run: |
           git config user.name  "brewser-catalogue-bot"
           git config user.email "brewser-catalogue-bot@users.noreply.github.com"
-          # catalogue.json is a pure function of apps/, so each attempt syncs to
-          # the very latest main, rebuilds, and pushes. If a concurrent writer
-          # (another run, or the plugin's promote/delete pushing straight to
-          # apps/) advanced main under us, the next iteration picks it up. This
-          # closes the cross-actor race the concurrency group can't cover, so a
-          # racing push never leaves a red failed run or a stale catalogue.
+          # index-fragment.json + artifacts/ are a pure function of apps/, so each
+          # attempt syncs to the latest main, rebuilds, and pushes; a concurrent
+          # writer (e.g. the plugin's promote pushing straight to apps/) is picked
+          # up on the next iteration. build_fragment.py fails LOUD on a >100 MiB
+          # file (GitHub's hard per-file push limit) so it surfaces at intake.
           for i in 1 2 3 4 5; do
             git fetch --quiet origin main
             git reset --quiet --hard origin/main
-            python scripts/build_catalog.py
-            git add -A -- catalogue.json artifacts
+            python scripts/build_fragment.py --source ext1
+            git add -A -- index-fragment.json artifacts
             if git diff --cached --quiet; then
-              echo "Catalogue already up to date."
+              echo "Fragment already up to date."
               exit 0
             fi
-            git commit -q -m "catalogue: rebuild from apps/"
+            git commit -q -m "fragment: rebuild from apps/"
             if git push origin HEAD:main; then
               echo "Pushed on attempt $i."
               exit 0
@@ -72,5 +66,5 @@ jobs:
             echo "Push raced by another writer; retrying ($i)…"
             sleep $((RANDOM % 4 + 1))
           done
-          echo "::error::catalogue push failed after 5 attempts (persistent contention)."
+          echo "::error::fragment push failed after 5 attempts (persistent contention)."
           exit 1

@@ -86,3 +86,32 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Notify base repo to re-merge the catalogue
+        # play1.brewser.io now serves the freshest index-fragment.json + files, so
+        # ping the base repo to re-merge play.brewser.io/catalogue.json (the fast
+        # path — repository_dispatch ext_fragment_updated). Done AFTER the deploy
+        # so the base merge, which fetches this fragment over Pages, reads the new
+        # copy rather than a stale one.
+        #
+        # repository_dispatch needs a token with write access to the BASE repo —
+        # the built-in GITHUB_TOKEN is scoped to THIS repo only. Store one as the
+        # BASE_MERGE_DISPATCH_TOKEN secret (fine-grained PAT, Contents:write on
+        # natureglass/Brewser-apps). Best-effort: a missing secret or a failed
+        # call never fails the deploy — the base repo's scheduled safety-net
+        # converges within its cron interval regardless.
+        env:
+          BASE_DISPATCH_TOKEN: ${{ secrets.BASE_MERGE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "${BASE_DISPATCH_TOKEN:-}" ]; then
+            echo "No BASE_MERGE_DISPATCH_TOKEN secret set — skipping ping (base cron will converge)."
+            exit 0
+          fi
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${BASE_DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/natureglass/Brewser-apps/dispatches" \
+            -d '{"event_type":"ext_fragment_updated","client_payload":{"source":"ext1"}}' \
+            && echo "Pinged base repo to re-merge the catalogue." \
+            || echo "Base ping failed — base cron safety-net will converge."

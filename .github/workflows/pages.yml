@@ -1,0 +1,88 @@
+name: Deploy Pages
+
+# Deterministic GitHub Pages publish for play1.brewser.io (extended storage).
+#
+# WHY THIS EXISTS: relying on GitHub's *automatic* branch build ("pages build and
+# deployment", event: dynamic) is a hidden dependency — on the base repo it
+# silently stopped firing for pushes on 2026-08-10 (no failed run, no email, no
+# Settings banner), freezing the live site on an old snapshot while main advanced.
+# Deploying from an explicit Actions workflow removes that risk: a failure shows
+# as a red run here, and this repo self-publishes on every push / catalogue
+# rebuild without any external trigger. NOTE: the Brewser WordPress plugin's
+# "Redeploy site" button targets the BASE repo only — it does NOT reach this
+# extended repo, so this workflow (push / workflow_run / manual "Run workflow")
+# is the sole publish path for play1.brewser.io.
+#
+# ONE-TIME SETUP (required): repo Settings → Pages → Build and deployment →
+# Source = "GitHub Actions". Until that switch is made, actions/deploy-pages
+# errors ("not configured to build from GitHub Actions"). The custom domain
+# (CNAME play1.brewser.io) and HTTPS settings carry over unchanged.
+
+on:
+  # Every push to main. Catches PAT pushes (the plugin's promote / edit / delete
+  # into apps/**). NOTE: the catalogue-rebuild bot commits catalogue.json with
+  # GITHUB_TOKEN, and a GITHUB_TOKEN push does NOT trigger workflows — that update
+  # is caught by the workflow_run trigger below instead.
+  push:
+    branches: [ main ]
+
+  # After "Build catalogue" finishes, redeploy so the freshly-generated
+  # catalogue.json + artifacts/ (committed by the bot, invisible to `push`) go
+  # live. This is the trigger that actually publishes a newly-promoted app.
+  workflow_run:
+    workflows: [ "Build catalogue" ]
+    types: [ completed ]
+
+  # Manual publish — "Run workflow" in the Actions UI. (The plugin's "Redeploy
+  # site" button does NOT target this extended repo — see the header note.)
+  # repository_dispatch is an equivalent programmatic entry point kept as a
+  # fallback for future tooling.
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [ redeploy_pages ]
+
+# One deploy at a time; a newer deploy supersedes an in-flight older one, so the
+# post-catalogue redeploy always wins over the earlier push-triggered one.
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    # For workflow_run, only publish when the catalogue build succeeded; a failed
+    # build must not push a half-rebuilt catalogue live. Every other event (push,
+    # workflow_dispatch, repository_dispatch) always deploys.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          # Always publish the current tip of main (incl. the bot's catalogue
+          # commit), not the SHA that happened to trigger this run.
+          ref: main
+
+      - name: Stage site (whole tree minus VCS internals)
+        # Serve exactly what the old branch build served: the entire repo. Only
+        # the .git dir is stripped (never served, and it bloats the artifact).
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          rsync -a --exclude='.git' --exclude='_site' ./ _site/
+
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
